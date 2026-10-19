@@ -22,7 +22,8 @@ Database::Database(const Napi::CallbackInfo& info) :
 	addon(static_cast<Addon*>(info.Data())),
 	logger(),
 	stmts(),
-	backups() {
+	backups(),
+	progress_handler() {
 	TYPE_TAG_CONSTRUCTOR(info);
 	JS_new(info);
 }
@@ -133,6 +134,7 @@ INIT(Database::Init) {
 		PrototypeMethod<Database, &Database::JS_close>("close", addon),
 		PrototypeMethod<Database, &Database::JS_defaultSafeIntegers>("defaultSafeIntegers", addon),
 		PrototypeMethod<Database, &Database::JS_unsafeMode>("unsafeMode", addon),
+		PrototypeMethod<Database, &Database::JS_progressHandler>("progressHandler", addon),
 	}, addon);
 }
 
@@ -419,6 +421,46 @@ NODE_METHOD(Database::JS_unsafeMode) {
 	else { REQUIRE_ARGUMENT_BOOLEAN(first, db->unsafe_mode); }
 	sqlite3_db_config(db->db_handle, SQLITE_DBCONFIG_DEFENSIVE, static_cast<int>(!db->unsafe_mode), NULL);
 	return info.Env().Undefined();
+}
+
+NODE_METHOD(Database::JS_progressHandler) {
+	UNWRAP_OR_RETURN(Database, db, info.This());
+	REQUIRE_DATABASE_OPEN(db);
+	// Also stops the callback from replacing itself while it is running.
+	REQUIRE_DATABASE_NOT_BUSY(db);
+	if (info.Length() == 0) {
+		sqlite3_progress_handler(db->db_handle, 0, NULL, NULL);
+		db->progress_handler.Reset();
+		return info.Env().Undefined();
+	}
+	REQUIRE_ARGUMENT_INT32(first, int interval);
+	REQUIRE_ARGUMENT_FUNCTION(second, Napi::Function fn);
+	if (interval <= 0) return ThrowRangeError(info.Env(), "Expected first argument to be a positive integer");
+	db->progress_handler = Napi::Persistent(fn);
+	sqlite3_progress_handler(db->db_handle, interval, ProgressHandlerCallback, db);
+	return info.Env().Undefined();
+}
+
+// Invoked by SQLite every N virtual machine instructions while a statement
+// runs. A truthy return value interrupts the statement with SQLITE_INTERRUPT.
+// If the callback throws, or JavaScript can no longer run (e.g., during
+// worker.terminate()), the statement is interrupted and the exception (if any)
+// is propagated instead.
+int Database::ProgressHandlerCallback(void* data) {
+	Database* db = static_cast<Database*>(data);
+	Napi::Env env = db->Env();
+	Napi::HandleScope scope(env);
+	Napi::Value result = SafeCall(env, db->progress_handler.Value(), env.Undefined(), 0, NULL);
+	if (result.IsEmpty() || env.IsExceptionPending()) {
+		db->was_js_error = true;
+		return 1;
+	}
+	Napi::Boolean interrupt = result.ToBoolean();
+	if (interrupt.IsEmpty()) {
+		db->was_js_error = true;
+		return 1;
+	}
+	return interrupt.Value() ? 1 : 0;
 }
 
 NODE_GETTER(Database::JS_open) {

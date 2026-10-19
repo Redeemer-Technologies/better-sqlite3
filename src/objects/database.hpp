@@ -76,11 +76,13 @@ private:
 	static NODE_METHOD(JS_close);
 	static NODE_METHOD(JS_defaultSafeIntegers);
 	static NODE_METHOD(JS_unsafeMode);
+	static NODE_METHOD(JS_progressHandler);
 	static NODE_GETTER(JS_open);
 	static NODE_GETTER(JS_inTransaction);
 
 	static bool Deserialize(Napi::Env env, Napi::Object buffer, Addon* addon, sqlite3* db_handle, bool readonly);
 	static void FreeSerialization(Napi::Env env, char* data);
+	static int ProgressHandlerCallback(void* data);
 
 	static const int MAX_BUFFER_SIZE;
 	static const int MAX_STRING_SIZE;
@@ -97,4 +99,5 @@ private:
 	Napi::Reference<Napi::Value> logger;
 	std::set<Statement*, CompareStatement> stmts;
 	std::set<Backup*, CompareBackup> backups;
+	Napi::FunctionReference progress_handler;
 };

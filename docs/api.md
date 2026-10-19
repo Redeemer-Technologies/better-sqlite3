@@ -19,6 +19,7 @@
 - [Database#table()](#tablename-definition---this)
 - [Database#loadExtension()](#loadextensionpath-entrypoint---this)
 - [Database#exec()](#execstring---this)
+- [Database#progressHandler()](#progresshandlerinterval-callback---this)
 - [Database#close()](#close---this)
 - [Properties](#properties)
 
@@ -396,6 +397,30 @@ Executes the given SQL string. Unlike [prepared statements](#preparestring---sta
 const migration = fs.readFileSync('migrate-schema.sql', 'utf8');
 db.exec(migration);
 ```
+
+### .progressHandler([*interval*, *callback*]) -> *this*
+
+Registers a callback that SQLite invokes every `interval` [virtual machine instructions](https://www.sqlite.org/opcode.html) while a statement runs (see [`sqlite3_progress_handler()`](https://www.sqlite.org/c3ref/progress_handler.html)). If the callback returns a truthy value, the running statement is interrupted and throws an [`SqliteError`](#class-sqliteerror) with the code `SQLITE_INTERRUPT`. If the callback throws, the statement is interrupted and that exception is thrown instead. Invoke the method without arguments to remove the callback.
+
+This can bound the time a query may take:
+
+```js
+let deadline = Infinity;
+db.progressHandler(10000, () => Date.now() > deadline);
+
+function allWithin(ms, stmt, ...params) {
+  deadline = Date.now() + ms;
+  try {
+    return stmt.all(...params);
+  } finally {
+    deadline = Infinity;
+  }
+}
+```
+
+While a callback is registered, terminating a [worker thread](./threads.md) also interrupts the statement it is running.
+
+The callback must not use the database connection. If an interrupted statement was writing inside a transaction, SQLite may have rolled back the whole transaction; check [`.inTransaction`](#properties) before rolling back. Smaller intervals respond sooner, but make queries slower.
 
 ### .close() -> *this*
 
