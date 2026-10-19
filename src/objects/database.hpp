@@ -77,6 +77,8 @@ private:
 	static NODE_METHOD(JS_defaultSafeIntegers);
 	static NODE_METHOD(JS_unsafeMode);
 	static NODE_METHOD(JS_progressHandler);
+	static NODE_METHOD(JS_collectScanStatus);
+	static NODE_METHOD(JS_status);
 	static NODE_GETTER(JS_open);
 	static NODE_GETTER(JS_inTransaction);
 

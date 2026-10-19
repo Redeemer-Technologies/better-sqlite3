@@ -50,6 +50,8 @@ private:
 	static NODE_METHOD(JS_safeIntegers);
 	static NODE_METHOD(JS_columns);
 	static NODE_METHOD(JS_toString);
+	static NODE_METHOD(JS_status);
+	static NODE_METHOD(JS_scanStatus);
 	static NODE_GETTER(JS_busy);
 
 	Database* db;

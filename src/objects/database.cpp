@@ -135,6 +135,8 @@ INIT(Database::Init) {
 		PrototypeMethod<Database, &Database::JS_defaultSafeIntegers>("defaultSafeIntegers", addon),
 		PrototypeMethod<Database, &Database::JS_unsafeMode>("unsafeMode", addon),
 		PrototypeMethod<Database, &Database::JS_progressHandler>("progressHandler", addon),
+		PrototypeMethod<Database, &Database::JS_collectScanStatus>("collectScanStatus", addon),
+		PrototypeMethod<Database, &Database::JS_status>("status", addon),
 	}, addon);
 }
 
@@ -172,6 +174,9 @@ NODE_METHOD(Database::JS_new) {
 	int status = sqlite3_db_config(db_handle, SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION, 1, NULL);
 	assert(status == SQLITE_OK); ((void)status);
 	status = sqlite3_db_config(db_handle, SQLITE_DBCONFIG_DEFENSIVE, 1, NULL);
+	assert(status == SQLITE_OK); ((void)status);
+	// Collecting scan status times every instruction; collectScanStatus() turns it on.
+	status = sqlite3_db_config(db_handle, SQLITE_DBCONFIG_STMT_SCANSTATUS, 0, NULL);
 	assert(status == SQLITE_OK); ((void)status);
 
 	if (buffer.IsBuffer() && !Deserialize(env, buffer.As<Napi::Object>(), addon, db_handle, readonly)) {
@@ -461,6 +466,43 @@ int Database::ProgressHandlerCallback(void* data) {
 		return 1;
 	}
 	return interrupt.Value() ? 1 : 0;
+}
+
+// Turns collection of the counters behind Statement#scanStatus() on or off.
+// SQLite only collects them for statements prepared and run while it is on.
+NODE_METHOD(Database::JS_collectScanStatus) {
+	UNWRAP_OR_RETURN(Database, db, info.This());
+	REQUIRE_DATABASE_OPEN(db);
+	bool enabled = true;
+	if (info.Length() > 0) { REQUIRE_ARGUMENT_BOOLEAN(first, enabled); }
+	sqlite3_db_config(db->db_handle, SQLITE_DBCONFIG_STMT_SCANSTATUS, static_cast<int>(enabled), NULL);
+	return info.Env().Undefined();
+}
+
+// The connection's page cache and temporary file counters, which SQLite
+// always keeps. Counters accumulate until a call passes reset = true.
+NODE_METHOD(Database::JS_status) {
+	UNWRAP_OR_RETURN(Database, db, info.This());
+	REQUIRE_DATABASE_OPEN(db);
+	bool reset = false;
+	if (info.Length() > 0 && !info[0].IsUndefined()) { REQUIRE_ARGUMENT_BOOLEAN(first, reset); }
+	static const struct { const char* name; int op; } counters[] = {
+		{ "cacheHits", SQLITE_DBSTATUS_CACHE_HIT },
+		{ "cacheMisses", SQLITE_DBSTATUS_CACHE_MISS },
+		{ "cacheWrites", SQLITE_DBSTATUS_CACHE_WRITE },
+		{ "cacheSpills", SQLITE_DBSTATUS_CACHE_SPILL },
+		{ "tempSpillBytes", SQLITE_DBSTATUS_TEMPBUF_SPILL },
+		{ "cacheUsedBytes", SQLITE_DBSTATUS_CACHE_USED },
+	};
+	Napi::Env env = info.Env();
+	Napi::Object result = Napi::Object::New(env);
+	for (const auto& counter : counters) {
+		sqlite3_int64 current = 0;
+		sqlite3_int64 highwater = 0;
+		sqlite3_db_status64(db->db_handle, counter.op, &current, &highwater, static_cast<int>(reset));
+		result.Set(counter.name, Napi::Number::New(env, static_cast<double>(current)));
+	}
+	return result;
 }
 
 NODE_GETTER(Database::JS_open) {

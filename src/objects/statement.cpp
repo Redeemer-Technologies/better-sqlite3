@@ -71,6 +71,8 @@ INIT(Statement::Init) {
 		PrototypeMethod<Statement, &Statement::JS_safeIntegers>("safeIntegers", addon),
 		PrototypeMethod<Statement, &Statement::JS_columns>("columns", addon),
 		PrototypeMethod<Statement, &Statement::JS_toString>("toString", addon),
+		PrototypeMethod<Statement, &Statement::JS_status>("status", addon),
+		PrototypeMethod<Statement, &Statement::JS_scanStatus>("scanStatus", addon),
 	}, addon);
 }
 
@@ -372,6 +374,95 @@ NODE_METHOD(Statement::JS_toString) {
 	return info.This().As<Napi::Object>()
 		.Get(addon->cs.source.Value())
 		.As<Napi::String>();
+}
+
+// The statement's counters, which SQLite always keeps. They accumulate over
+// every run of the statement until a call passes reset = true.
+NODE_METHOD(Statement::JS_status) {
+	UNWRAP_OR_RETURN(Statement, stmt, info.This());
+	REQUIRE_DATABASE_OPEN(stmt->db->GetState());
+	bool reset = false;
+	if (info.Length() > 0 && !info[0].IsUndefined()) { REQUIRE_ARGUMENT_BOOLEAN(first, reset); }
+	static const struct { const char* name; int op; } counters[] = {
+		{ "fullscanSteps", SQLITE_STMTSTATUS_FULLSCAN_STEP },
+		{ "sorts", SQLITE_STMTSTATUS_SORT },
+		{ "autoindexInserts", SQLITE_STMTSTATUS_AUTOINDEX },
+		{ "vmSteps", SQLITE_STMTSTATUS_VM_STEP },
+		{ "reprepares", SQLITE_STMTSTATUS_REPREPARE },
+		{ "runs", SQLITE_STMTSTATUS_RUN },
+		{ "filterMisses", SQLITE_STMTSTATUS_FILTER_MISS },
+		{ "filterHits", SQLITE_STMTSTATUS_FILTER_HIT },
+		{ "memoryUsed", SQLITE_STMTSTATUS_MEMUSED },
+	};
+	Napi::Env env = info.Env();
+	Napi::Object result = Napi::Object::New(env);
+	for (const auto& counter : counters) {
+		// SQLite keeps these as 32-bit unsigned counters but returns an int.
+		unsigned int value = static_cast<unsigned int>(sqlite3_stmt_status(stmt->handle, counter.op, static_cast<int>(reset)));
+		result.Set(counter.name, Napi::Number::New(env, static_cast<double>(value)));
+	}
+	return result;
+}
+
+// A count from sqlite3_stmt_scanstatus_v2(), or null where SQLite has none (-1).
+static Napi::Value ScanCount(Napi::Env env, sqlite3_int64 value) {
+	if (value < 0) return env.Null();
+	return Napi::Number::New(env, static_cast<double>(value));
+}
+
+// What each element of the query plan did, for statements prepared and run
+// while the connection collected scan status (see collectScanStatus()). The
+// ids match those of EXPLAIN QUERY PLAN. Counters accumulate over every run
+// of the statement until a call passes reset = true.
+NODE_METHOD(Statement::JS_scanStatus) {
+	UNWRAP_OR_RETURN(Statement, stmt, info.This());
+	REQUIRE_DATABASE_OPEN(stmt->db->GetState());
+	bool reset = false;
+	if (info.Length() > 0 && !info[0].IsUndefined()) { REQUIRE_ARGUMENT_BOOLEAN(first, reset); }
+	Napi::Env env = info.Env();
+	sqlite3_stmt* handle = stmt->handle;
+	const int flags = SQLITE_SCANSTAT_COMPLEX;
+
+	Napi::Array steps = Napi::Array::New(env);
+	for (int i = 0; ; ++i) {
+		int id = -1;
+		if (sqlite3_stmt_scanstatus_v2(handle, i, SQLITE_SCANSTAT_SELECTID, flags, &id) != 0) break;
+		int parent = -1;
+		sqlite3_int64 loops = -1;
+		sqlite3_int64 visited = -1;
+		sqlite3_int64 cycles = -1;
+		double estimate = 0;
+		const char* name = NULL;
+		const char* explain = NULL;
+		sqlite3_stmt_scanstatus_v2(handle, i, SQLITE_SCANSTAT_PARENTID, flags, &parent);
+		sqlite3_stmt_scanstatus_v2(handle, i, SQLITE_SCANSTAT_NLOOP, flags, &loops);
+		sqlite3_stmt_scanstatus_v2(handle, i, SQLITE_SCANSTAT_NVISIT, flags, &visited);
+		sqlite3_stmt_scanstatus_v2(handle, i, SQLITE_SCANSTAT_NCYCLE, flags, &cycles);
+		sqlite3_stmt_scanstatus_v2(handle, i, SQLITE_SCANSTAT_EST, flags, &estimate);
+		sqlite3_stmt_scanstatus_v2(handle, i, SQLITE_SCANSTAT_NAME, flags, &name);
+		sqlite3_stmt_scanstatus_v2(handle, i, SQLITE_SCANSTAT_EXPLAIN, flags, &explain);
+
+		Napi::Object step = Napi::Object::New(env);
+		step.Set("id", ScanCount(env, id));
+		step.Set("parentId", ScanCount(env, parent));
+		step.Set("explain", explain ? static_cast<Napi::Value>(StringFromUtf8(env, explain, -1)) : env.Null());
+		step.Set("name", name ? static_cast<Napi::Value>(StringFromUtf8(env, name, -1)) : env.Null());
+		step.Set("loops", ScanCount(env, loops));
+		step.Set("rowsVisited", ScanCount(env, visited));
+		// The planner's estimate of rows per loop is only meaningful for loops (SCAN and SEARCH).
+		step.Set("estimatedRows", name ? static_cast<Napi::Value>(Napi::Number::New(env, estimate)) : env.Null());
+		step.Set("cycles", ScanCount(env, cycles));
+		steps.Set(static_cast<uint32_t>(i), step);
+	}
+
+	sqlite3_int64 total = -1;
+	sqlite3_stmt_scanstatus_v2(handle, -1, SQLITE_SCANSTAT_NCYCLE, flags, &total);
+	if (reset) sqlite3_stmt_scanstatus_reset(handle);
+
+	Napi::Object result = Napi::Object::New(env);
+	result.Set("cycles", ScanCount(env, total));
+	result.Set("steps", steps);
+	return result;
 }
 
 NODE_GETTER(Statement::JS_busy) {

@@ -20,6 +20,8 @@
 - [Database#loadExtension()](#loadextensionpath-entrypoint---this)
 - [Database#exec()](#execstring---this)
 - [Database#progressHandler()](#progresshandlerinterval-callback---this)
+- [Database#collectScanStatus()](#collectscanstatusenabled---this)
+- [Database#status()](#statusreset---object)
 - [Database#close()](#close---this)
 - [Properties](#properties)
 
@@ -422,6 +424,37 @@ While a callback is registered, terminating a [worker thread](./threads.md) also
 
 The callback must not use the database connection. If an interrupted statement was writing inside a transaction, SQLite may have rolled back the whole transaction; check [`.inTransaction`](#properties) before rolling back. Smaller intervals respond sooner, but make queries slower.
 
+### .collectScanStatus([*enabled*]) -> *this*
+
+Turns on (the default argument) or off the collection of the counters that [`Statement#scanStatus()`](#scanstatusreset---object) reports (see [`SQLITE_DBCONFIG_STMT_SCANSTATUS`](https://www.sqlite.org/c3ref/c_dbconfig_defensive.html#sqlitedbconfigstmtscanstatus)). It is **off** when a connection opens. SQLite turns it on by default; this fork turns it off, because while it is on SQLite reads a hardware timer around every virtual machine instruction. In one benchmark (a `GROUP BY` over 400,000 rows, on Windows) a statement took about 3 times as long with collection on; with it off, it took as long as in a build without scan status.
+
+SQLite only collects the counters for statements that were both prepared and run while collection was on. Changing it makes SQLite prepare existing statements again before their next run, which discards the counters they had.
+
+```js
+db.collectScanStatus();
+const stmt = db.prepare('SELECT count(*) FROM cats WHERE age > ?');
+stmt.get(3);
+console.log(stmt.scanStatus());
+db.collectScanStatus(false);
+```
+
+### .status([*reset*]) -> *object*
+
+Returns the connection's page cache and temporary file counters (see [`sqlite3_db_status()`](https://www.sqlite.org/c3ref/db_status.html)), which SQLite always keeps. The counters accumulate over every statement until a call passes `reset = true`, which returns them and then sets them to zero.
+
+```js
+db.status(true);
+stmt.all();
+console.log(db.status());
+// => { cacheHits: 6, cacheMisses: 0, cacheWrites: 0, cacheSpills: 0, tempSpillBytes: 0, cacheUsedBytes: 30943 }
+```
+
+- `cacheHits`, `cacheMisses`: pages found, or not found, in the connection's page cache. A miss is read from the operating system, which may still have it cached.
+- `cacheWrites`: pages written to the database file.
+- `cacheSpills`: dirty pages written to the file before their transaction committed, because the cache was full.
+- `tempSpillBytes`: bytes written to temporary files, such as a large sort, that could have stayed in memory with more of it.
+- `cacheUsedBytes`: the memory the page cache uses now. Resetting does not change it.
+
 ### .close() -> *this*
 
 Closes the database connection. After invoking this method, no statements can be created or executed.
@@ -459,6 +492,8 @@ An object representing a single SQL statement.
 - [Statement#columns()](#columns---array-of-objects)
 - [Statement#bind()](#bindbindparameters---this)
 - [Statement#toString()](#tostring---string)
+- [Statement#status()](#statusreset---object-1)
+- [Statement#scanStatus()](#scanstatusreset---object)
 - [Properties](#properties-1)
 
 > NOTE: If you've used the [SQLite C API](https://www.sqlite.org/c3ref), you might expect there to be a ["finalize"](https://www.sqlite.org/c3ref/finalize.html) method, but `better-sqlite3` automatically handles this during garbage collection (or when the associated database is closed).
@@ -650,6 +685,53 @@ console.log(stmt.toString()); // => "SELECT * FROM cats WHERE name = 'Joey'"
 ```
 
 > Only parameters that are bound *permanently* via [`.bind()`](#bindbindparameters---this) are expanded. Temporary parameters passed to an execution method such as [`.get()`](#getbindparameters---row) are not reflected here. For that, you can use the [`verbose`](#new-databasepath-options) option when opening the database.
+
+### .status([*reset*]) -> *object*
+
+Returns the statement's counters (see [`sqlite3_stmt_status()`](https://www.sqlite.org/c3ref/stmt_status.html)), which SQLite always keeps. They accumulate over every run of the statement, and survive an iterator that stops early, until a call passes `reset = true`, which returns them and then sets them to zero.
+
+```js
+const stmt = db.prepare('SELECT * FROM cats ORDER BY name');
+stmt.all();
+console.log(stmt.status());
+// => { fullscanSteps: 999, sorts: 1, autoindexInserts: 0, vmSteps: 10009, reprepares: 0, runs: 1, filterMisses: 0, filterHits: 0, memoryUsed: 2681 }
+```
+
+- `fullscanSteps`: steps forward through a table or index in a full scan.
+- `sorts`: sort operations.
+- `autoindexInserts`: rows inserted into indexes SQLite built for the statement on its own (automatic indexes).
+- `vmSteps`: virtual machine instructions run; a measure of the total work. SQLite counts it in 32 bits, so it wraps past 4,294,967,295.
+- `reprepares`: times SQLite prepared the statement again, as after a schema change.
+- `runs`: times the statement ran to completion or was reset.
+- `filterMisses`, `filterHits`: Bloom filter checks that ruled a row out, or let it through.
+- `memoryUsed`: bytes the prepared statement uses now. Resetting does not change it.
+
+### .scanStatus([*reset*]) -> *object*
+
+Returns what each element of the statement's query plan did (see [`sqlite3_stmt_scanstatus_v2()`](https://www.sqlite.org/c3ref/stmt_scanstatus.html)): `{ cycles, steps }`, where `cycles` is the hardware timer's count for the whole statement and `steps` has one object per element of its [`EXPLAIN QUERY PLAN`](https://www.sqlite.org/eqp.html). SQLite only collects these for a statement prepared and run while the connection [collects scan status](#collectscanstatusenabled---this); otherwise `steps` is empty. Like [`.status()`](#statusreset---object-1), the counters accumulate until a call passes `reset = true`.
+
+```js
+db.collectScanStatus();
+const stmt = db.prepare('SELECT age, count(*) FROM cats WHERE age > 3 GROUP BY age');
+stmt.all();
+console.log(stmt.scanStatus());
+// => { cycles: 2599, steps: [
+//   { id: 6, parentId: 0, explain: 'SCAN cats', name: 'cats', loops: 1, rowsVisited: 1000, estimatedRows: 983040, cycles: 585 },
+//   { id: 10, parentId: 0, explain: 'USE TEMP B-TREE FOR GROUP BY', name: null, loops: 1, rowsVisited: 800, estimatedRows: null, cycles: 775 },
+// ] }
+```
+
+(Here the planner, without [`ANALYZE`](https://www.sqlite.org/lang_analyze.html) statistics, guessed far more rows than the table has.)
+
+- `id`, `parentId`: the element's `id` and `parent` in `EXPLAIN QUERY PLAN`, to draw the plan as a tree.
+- `explain`: the element as `EXPLAIN QUERY PLAN` describes it.
+- `name`: the table or index a loop (`SCAN` or `SEARCH`) reads; `null` for other elements.
+- `loops`: times the loop ran, as once for each row of an outer loop.
+- `rowsVisited`: rows it read over all of those loops.
+- `estimatedRows`: the query planner's estimate of the rows *each* loop reads, for loops only. Compare `estimatedRows × loops` with `rowsVisited` to see how far off the planner was.
+- `cycles`: the hardware timer's count while the element ran. Divide by the statement's `cycles` for its share of the time. The timer, and so the unit, depends on the platform: the processor's time-stamp counter (`rdtsc`) on x86-64 with GCC or Clang, `QueryPerformanceCounter()` on Windows, and the virtual counter (`cntvct_el0`) on 64-bit ARM. On other platforms it is always 0.
+
+Any of these is `null` where SQLite has no value for the element.
 
 ## Properties
 

@@ -52,9 +52,11 @@
       'direct_dependent_settings': {
         'include_dirs': ['<(SHARED_INTERMEDIATE_DIR)/sqlite3/'],
       },
-      'cflags': ['-std=c99', '-w'],
+      # gnu99 rather than c99: under strict ISO C, SQLite cannot read the
+      # processor's timer, and Statement#scanStatus() reports 0 cycles.
+      'cflags': ['-std=gnu99', '-w'],
       'xcode_settings': {
-        'OTHER_CFLAGS': ['-std=c99'],
+        'OTHER_CFLAGS': ['-std=gnu99'],
         'WARNING_CFLAGS': ['-w'],
       },
       'conditions': [
