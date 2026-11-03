@@ -122,3 +122,58 @@ describe('Statement#scanStatus()', function () {
 		expect(stmt.scanStatus().steps).to.deep.equal([]);
 	});
 });
+
+describe('Statement#bytecode()', function () {
+	beforeEach(function () {
+		this.db = new Database(util.next());
+		this.db.exec('CREATE TABLE entries (a INTEGER, b TEXT); CREATE INDEX entries_a ON entries (a)');
+		this.db.prepare('WITH RECURSIVE s(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM s LIMIT 1000) INSERT INTO entries SELECT value, value % 7 FROM s').run();
+	});
+	afterEach(function () {
+		this.db.close();
+	});
+
+	it('should list the statement\'s instructions as EXPLAIN does', function () {
+		const stmt = this.db.prepare('SELECT b FROM entries WHERE a > 100');
+		const program = stmt.bytecode();
+		const explain = this.db.prepare('EXPLAIN SELECT b FROM entries WHERE a > 100').all();
+		expect(program.map(op => [op.addr, op.opcode, op.p1, op.p2, op.p3, op.p5])).to.deep.equal(explain.map(op => [op.addr, op.opcode, op.p1, op.p2, op.p3, op.p5]));
+		expect(Object.keys(program[0])).to.deep.equal(['addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'p5', 'subprogram', 'runs', 'cycles']);
+		expect(program[0].opcode).to.equal('Init');
+		expect(program[0].subprogram).to.equal(null);
+	});
+	it('should count the times each instruction ran, when the connection collected scan status', function () {
+		this.db.collectScanStatus();
+		const stmt = this.db.prepare('SELECT b FROM entries WHERE a > 100');
+		expect(stmt.all().length).to.equal(900);
+		const program = stmt.bytecode();
+		expect(program.find(op => op.opcode === 'ResultRow').runs).to.equal(900);
+		expect(program.find(op => op.opcode === 'Init').runs).to.equal(1);
+		// With scan status on, the program marks where each step of the query plan starts.
+		const plan = stmt.scanStatus().steps;
+		expect(program.filter(op => op.opcode === 'Explain').map(op => op.p1)).to.deep.equal(plan.map(step => step.id));
+		stmt.scanStatus(true);
+		expect(stmt.bytecode().every(op => op.runs === 0 && op.cycles === 0)).to.equal(true);
+	});
+	it('should count nothing when the connection did not collect scan status', function () {
+		const stmt = this.db.prepare('SELECT b FROM entries');
+		stmt.all();
+		expect(stmt.bytecode().every(op => op.runs === 0)).to.equal(true);
+	});
+	it('should list a trigger\'s program with its name', function () {
+		this.db.exec("CREATE TABLE log (what TEXT); CREATE TRIGGER entries_log AFTER UPDATE ON entries BEGIN INSERT INTO log VALUES ('changed'); END");
+		this.db.collectScanStatus();
+		const stmt = this.db.prepare('UPDATE entries SET b = b WHERE a <= 3');
+		stmt.run();
+		const trigger = stmt.bytecode().filter(op => op.subprogram === 'TRIGGER entries_log');
+		expect(trigger.length).to.be.above(0);
+		expect(trigger.find(op => op.opcode === 'Insert').runs).to.equal(3);
+	});
+	it('should be readable while an iterator is open', function () {
+		const stmt = this.db.prepare('SELECT * FROM entries');
+		const iterator = stmt.iterate();
+		iterator.next();
+		expect(stmt.bytecode().length).to.be.above(0);
+		iterator.return();
+	});
+});

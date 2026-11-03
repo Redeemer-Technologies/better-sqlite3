@@ -52,6 +52,7 @@ private:
 	static NODE_METHOD(JS_toString);
 	static NODE_METHOD(JS_status);
 	static NODE_METHOD(JS_scanStatus);
+	static NODE_METHOD(JS_bytecode);
 	static NODE_GETTER(JS_busy);
 
 	Database* db;

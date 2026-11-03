@@ -494,6 +494,7 @@ An object representing a single SQL statement.
 - [Statement#toString()](#tostring---string)
 - [Statement#status()](#statusreset---object-1)
 - [Statement#scanStatus()](#scanstatusreset---object)
+- [Statement#bytecode()](#bytecode---array-of-objects)
 - [Properties](#properties-1)
 
 > NOTE: If you've used the [SQLite C API](https://www.sqlite.org/c3ref), you might expect there to be a ["finalize"](https://www.sqlite.org/c3ref/finalize.html) method, but `better-sqlite3` automatically handles this during garbage collection (or when the associated database is closed).
@@ -732,6 +733,35 @@ console.log(stmt.scanStatus());
 - `cycles`: the hardware timer's count while the element ran. Divide by the statement's `cycles` for its share of the time. The timer, and so the unit, depends on the platform: the processor's time-stamp counter (`rdtsc`) on x86-64 with GCC or Clang, `QueryPerformanceCounter()` on Windows, and the virtual counter (`cntvct_el0`) on 64-bit ARM. On other platforms it is always 0.
 
 Any of these is `null` where SQLite has no value for the element.
+
+### .bytecode() -> *array of objects*
+
+Returns the statement's virtual machine program, one object per instruction, from SQLite's [bytecode virtual table](https://www.sqlite.org/bytecodevtab.html) given this prepared statement itself. The instructions are those [`EXPLAIN`](https://www.sqlite.org/opcode.html) lists, each with the counts SQLite kept while the statement ran: how many times it ran, and the hardware timer's count while it did. SQLite only keeps those for a statement prepared and run while the connection [collects scan status](#collectscanstatusenabled---this); otherwise they are 0. Like [`.scanStatus()`](#scanstatusreset---object)'s, they accumulate over runs until `.scanStatus(true)` sets them to zero.
+
+While it collects scan status, SQLite also puts an `Explain` instruction where the code of each element of the query plan starts, with the element's `id` as its `p1`, so instructions can be matched with [`.scanStatus()`](#scanstatusreset---object)'s steps.
+
+```js
+db.collectScanStatus();
+const stmt = db.prepare('SELECT name FROM cats WHERE age > 3');
+stmt.all();
+console.log(stmt.bytecode());
+// => [
+//   { addr: 0, opcode: 'Init', p1: 1, p2: 10, p3: 0, p4: null, p5: 0, subprogram: null, runs: 1, cycles: 1 },
+//   { addr: 1, opcode: 'OpenRead', p1: 0, p2: 2, p3: 0, p4: '2', p5: 0, subprogram: null, runs: 1, cycles: 1 },
+//   { addr: 2, opcode: 'Explain', p1: 2, p2: 0, p3: 216, p4: 'SCAN cats', p5: 0, subprogram: null, runs: 1, cycles: 1 },
+//   { addr: 3, opcode: 'Rewind', p1: 0, p2: 9, p3: 0, p4: null, p5: 0, subprogram: null, runs: 1, cycles: 2 },
+//   { addr: 4, opcode: 'Column', p1: 0, p2: 1, p3: 1, p4: null, p5: 0, subprogram: null, runs: 1000, cycles: 222 },
+//   { addr: 5, opcode: 'Le', p1: 2, p2: 8, p3: 1, p4: 'BINARY-8', p5: 84, subprogram: null, runs: 1000, cycles: 187 },
+//   ...
+//   { addr: 7, opcode: 'ResultRow', p1: 3, p2: 1, p3: 0, p4: null, p5: 0, subprogram: null, runs: 600, cycles: 110 },
+//   ...
+// ]
+```
+
+- `addr`, `opcode`, `p1` … `p5`: the instruction, as `EXPLAIN` shows it. `p4` is text, or `null`. There is no `comment`: SQLite only writes those when compiled with `SQLITE_ENABLE_EXPLAIN_COMMENTS`, which this fork leaves out because SQLite would then write them while preparing every statement.
+- `subprogram`: `'TRIGGER name'` for an instruction in a trigger's program, `'(FK)'` in a foreign key check's, and `null` in the statement's own.
+- `runs`: times the instruction ran.
+- `cycles`: the hardware timer's count while it ran, in the same unit as `.scanStatus()`'s.
 
 ## Properties
 

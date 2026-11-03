@@ -73,6 +73,7 @@ INIT(Statement::Init) {
 		PrototypeMethod<Statement, &Statement::JS_toString>("toString", addon),
 		PrototypeMethod<Statement, &Statement::JS_status>("status", addon),
 		PrototypeMethod<Statement, &Statement::JS_scanStatus>("scanStatus", addon),
+		PrototypeMethod<Statement, &Statement::JS_bytecode>("bytecode", addon),
 	}, addon);
 }
 
@@ -462,6 +463,58 @@ NODE_METHOD(Statement::JS_scanStatus) {
 	Napi::Object result = Napi::Object::New(env);
 	result.Set("cycles", ScanCount(env, total));
 	result.Set("steps", steps);
+	return result;
+}
+
+// The statement's virtual machine program, one object per instruction, from
+// SQLite's bytecode virtual table given this statement itself, so that each
+// instruction has the counts scan status collected for it: the times it ran
+// and the timer's count while it ran. Those are 0 for a statement prepared
+// while the connection did not collect scan status.
+NODE_METHOD(Statement::JS_bytecode) {
+	UNWRAP_OR_RETURN(Statement, stmt, info.This());
+	REQUIRE_DATABASE_OPEN(stmt->db->GetState());
+	Napi::Env env = info.Env();
+	sqlite3_stmt* listing;
+	static const char sql[] = "SELECT addr, opcode, p1, p2, p3, p4, p5, subprog, nexec, ncycle FROM bytecode(?1)";
+	if (sqlite3_prepare_v2(stmt->db->GetHandle(), sql, -1, &listing, NULL) != SQLITE_OK) {
+		stmt->db->ThrowDatabaseError(env);
+		return env.Undefined();
+	}
+	sqlite3_bind_pointer(listing, 1, stmt->handle, "stmt-pointer", NULL);
+
+	auto text = [&](int column) -> Napi::Value {
+		const unsigned char* value = sqlite3_column_text(listing, column);
+		if (value == NULL) return env.Null();
+		return StringFromUtf8(env, reinterpret_cast<const char*>(value), sqlite3_column_bytes(listing, column));
+	};
+	auto number = [&](int column) -> Napi::Value {
+		return Napi::Number::New(env, static_cast<double>(sqlite3_column_int64(listing, column)));
+	};
+
+	Napi::Array result = Napi::Array::New(env);
+	uint32_t i = 0;
+	int status;
+	while ((status = sqlite3_step(listing)) == SQLITE_ROW) {
+		Napi::Object op = Napi::Object::New(env);
+		op.Set("addr", number(0));
+		op.Set("opcode", text(1));
+		op.Set("p1", number(2));
+		op.Set("p2", number(3));
+		op.Set("p3", number(4));
+		op.Set("p4", text(5));
+		op.Set("p5", number(6));
+		// The trigger or foreign key program an instruction belongs to; null for the statement's own.
+		op.Set("subprogram", text(7));
+		op.Set("runs", number(8));
+		op.Set("cycles", number(9));
+		result.Set(i++, op);
+	}
+	sqlite3_finalize(listing);
+	if (status != SQLITE_DONE) {
+		stmt->db->ThrowDatabaseError(env);
+		return env.Undefined();
+	}
 	return result;
 }
 
