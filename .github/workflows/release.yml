@@ -1,0 +1,127 @@
+# Releases of this fork, for Riverside (Redeemer-Technologies/foundations), which pins them.
+#
+# Pushing a tag that starts with v (such as v13.0.3-rt.1) builds the native module from that commit
+# for each platform, runs the test suite against it, and attaches the binaries to a GitHub release
+# with SHA256SUMS. Nothing is published to npm: build.yml's publish job runs only for upstream's
+# releases, and a release created here with GITHUB_TOKEN does not start other workflows.
+#
+# The module uses Node-API, so one binary serves every Node version from 22 (package.json "engines").
+# Linux glibc builds are made in Debian bookworm (glibc 2.36), so they run there and on anything newer,
+# such as trixie, which Riverside's images use. lib/binding.js loads prebuilds/<platform>-<arch>.node
+# before anything node-gyp built: a consumer puts the binary there.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: linux-x64, os: ubuntu-24.04, image: 'node:24-bookworm', setup: '' }
+          - { target: linux-arm64, os: ubuntu-24.04-arm, image: 'node:24-bookworm', setup: '' }
+          - { target: linuxmusl-x64, os: ubuntu-24.04, image: 'node:24-alpine', setup: 'apk add --no-cache build-base python3 py3-setuptools' }
+          - { target: linuxmusl-arm64, os: ubuntu-24.04-arm, image: 'node:24-alpine', setup: 'apk add --no-cache build-base python3 py3-setuptools' }
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test in ${{ matrix.image }}
+        run: |
+          docker run --rm --volume "$PWD:/project" --workdir /project '${{ matrix.image }}' sh -euc '
+            ${{ matrix.setup }}
+            npm install --ignore-scripts --no-audit --no-fund
+            npm run build-release
+            npm test
+            mkdir -p prebuilds
+            cp build/Release/better_sqlite3.node prebuilds/${{ matrix.target }}.node
+            node -e "const D = require(\"./lib\"); const db = new D(\":memory:\", { nativeBinding: \"prebuilds/${{ matrix.target }}.node\" }); console.log(\"SQLite\", db.prepare(\"SELECT sqlite_version() AS v\").get().v); db.close()"
+          '
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: prebuilds/${{ matrix.target }}.node
+          if-no-files-found: error
+
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: darwin-x64, os: macos-15-intel }
+          - { target: darwin-arm64, os: macos-15 }
+          - { target: win32-x64, os: windows-2022 }
+          - { target: win32-arm64, os: windows-11-arm }
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - if: ${{ startsWith(matrix.os, 'windows') }}
+        run: pip.exe install setuptools
+      - if: ${{ startsWith(matrix.os, 'macos') }}
+        run: brew install python-setuptools
+      - run: npm install --ignore-scripts --no-audit --no-fund
+      - run: npm run build-release
+      - run: npm test
+      - name: Check the binary loads from prebuilds/
+        run: |
+          mkdir -p prebuilds
+          cp build/Release/better_sqlite3.node prebuilds/${{ matrix.target }}.node
+          node -e "const D = require('./lib'); const db = new D(':memory:', { nativeBinding: 'prebuilds/${{ matrix.target }}.node' }); console.log('SQLite', db.prepare('SELECT sqlite_version() AS v').get().v); db.close()"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: prebuilds/${{ matrix.target }}.node
+          if-no-files-found: error
+
+  release:
+    needs: [linux, native]
+    name: Publish the GitHub release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+      - name: Name the binaries and checksum them
+        run: |
+          mkdir release
+          for target in linux-x64 linux-arm64 linuxmusl-x64 linuxmusl-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
+            cp "artifacts/$target/$target.node" "release/better-sqlite3-$GITHUB_REF_NAME-$target.node"
+          done
+          cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          linux=$(grep -- '-linux-x64.node$' release/SHA256SUMS | cut -d' ' -f1)
+          cat > notes.md <<EOF
+          Built from $GITHUB_SHA. Node-API, for Node 22 and later. Put a binary at
+          \`node_modules/better-sqlite3/prebuilds/<platform>-<arch>.node\`, where lib/binding.js loads it first.
+
+          To pin it in Riverside: point \`better-sqlite3\` in package.json at
+          \`https://codeload.github.com/$GITHUB_REPOSITORY/tar.gz/$GITHUB_SHA\`, and set in api/Dockerfile:
+
+          \`\`\`
+          ARG BETTER_SQLITE3_RELEASE=$GITHUB_REF_NAME
+          ARG BETTER_SQLITE3_SHA256=$linux
+          \`\`\`
+          EOF
+          gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
