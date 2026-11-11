@@ -2,8 +2,8 @@
 #
 # Pushing a tag that starts with v (such as v13.0.3-rt.1) builds the native module from that commit
 # for each platform, runs the test suite against it, and attaches the binaries to a GitHub release
-# with SHA256SUMS. Nothing is published to npm: build.yml's publish job runs only for upstream's
-# releases, and a release created here with GITHUB_TOKEN does not start other workflows.
+# with SHA256SUMS. Nothing is published to npm. It is this fork's only workflow: upstream's (build,
+# bump-version, update-sqlite) are removed.
 #
 # The module uses Node-API, so one binary serves every Node version from 22 (package.json "engines").
 # Linux glibc builds are made in Debian bookworm (glibc 2.36), so they run there and on anything newer,
