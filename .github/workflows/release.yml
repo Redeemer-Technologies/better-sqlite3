@@ -1,8 +1,8 @@
 # Releases of this fork, for Riverside (Redeemer-Technologies/foundations), which pins them.
 #
 # Pushing a tag that starts with v (such as v13.0.3-rt.1) builds the native module from that commit
-# for each platform, runs the test suite against it, and attaches the binaries to a GitHub release
-# with SHA256SUMS. Nothing is published to npm. It is this fork's only workflow: upstream's (build,
+# for Linux (glibc and musl) and Windows, x64 and arm64, runs the test suite against it, and attaches
+# the binaries to a GitHub release with SHA256SUMS. linux-x64 is required; the rest are best-effort. Nothing is published to npm. It is this fork's only workflow: upstream's (build,
 # bump-version, update-sqlite) are removed.
 #
 # The module uses Node-API, so one binary serves every Node version from 22 (package.json "engines").
@@ -94,14 +94,13 @@ jobs:
           path: prebuilds/${{ matrix.target }}.node
           if-no-files-found: error
 
-  native:
+  # No macOS builds: Riverside does not support it.
+  windows:
     needs: check
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: darwin-x64, os: macos-15-intel }
-          - { target: darwin-arm64, os: macos-15 }
           - { target: win32-x64, os: windows-2022 }
           - { target: win32-arm64, os: windows-11-arm }
     name: Build ${{ matrix.target }}
@@ -114,10 +113,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-      - if: ${{ startsWith(matrix.os, 'windows') }}
-        run: pip.exe install setuptools
-      - if: ${{ startsWith(matrix.os, 'macos') }}
-        run: brew install python-setuptools
+      - run: pip.exe install setuptools
       - run: npm install --ignore-scripts --no-audit --no-fund
       - run: npm run build-release
       - run: npm test
@@ -132,8 +128,12 @@ jobs:
           path: prebuilds/${{ matrix.target }}.node
           if-no-files-found: error
 
+  # Riverside needs linux-x64, so a release needs it. The other platforms are best-effort: a build
+  # that fails, or never gets a runner, is left out and named in the release notes. needs.<job>.result
+  # covers a whole matrix, so what was built is read from the artifacts instead.
   release:
-    needs: [check, linux, native]
+    needs: [check, linux, windows]
+    if: ${{ !cancelled() && needs.check.result == 'success' }}
     name: Publish the GitHub release
     runs-on: ubuntu-24.04
     permissions:
@@ -148,9 +148,19 @@ jobs:
       - name: Name the binaries and checksum them
         run: |
           mkdir release
-          for target in linux-x64 linux-arm64 linuxmusl-x64 linuxmusl-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
-            cp "artifacts/$target/$target.node" "release/better-sqlite3-$GITHUB_REF_NAME-$target.node"
+          missing=''
+          for target in linux-x64 linux-arm64 linuxmusl-x64 linuxmusl-arm64 win32-x64 win32-arm64; do
+            if [ -f "artifacts/$target/$target.node" ]; then
+              cp "artifacts/$target/$target.node" "release/better-sqlite3-$GITHUB_REF_NAME-$target.node"
+            elif [ "$target" = linux-x64 ]; then
+              echo "::error::linux-x64 did not build, and Riverside needs it: no release"
+              exit 1
+            else
+              echo "::warning::$target did not build; the release leaves it out"
+              missing="$missing $target"
+            fi
           done
+          echo "MISSING=${missing# }" >> "$GITHUB_ENV"
           cd release && sha256sum * > SHA256SUMS && cat SHA256SUMS
       - name: Create the release
         env:
@@ -176,4 +186,7 @@ jobs:
           ARG BETTER_SQLITE3_SHA256=$linux
           \`\`\`
           EOF
+          if [ -n "$MISSING" ]; then
+            printf '\nNot built this time, so not included: %s. Build them from source with `npm run build-release`.\n' "$MISSING" >> notes.md
+          fi
           gh release create "$GITHUB_REF_NAME" release/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
