@@ -23,7 +23,48 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # A tag names the upstream release it is based on and a revision of this fork's changes on top:
+  # v13.0.3-rt.1, v13.0.3-rt.2, then v13.1.0-rt.1 after merging upstream's v13.1.0. The upstream
+  # release must be the newest one in the tagged commit's history, so the name cannot claim another.
+  check:
+    name: Check the tag names its upstream release
+    runs-on: ubuntu-24.04
+    outputs:
+      base: ${{ steps.base.outputs.base }}
+      base_sha: ${{ steps.base.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: base
+        name: Find the newest upstream release this commit contains
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+)-rt\.[1-9][0-9]*$ ]]; then
+            echo "::error::Name the tag <upstream release>-rt.<revision>, such as v13.0.3-rt.1, not $GITHUB_REF_NAME"
+            exit 1
+          fi
+          claimed="${BASH_REMATCH[1]}"
+          # Upstream's release tags and the commits they name (for an annotated tag, its ^{} line).
+          git ls-remote --tags https://github.com/WiseLibs/better-sqlite3.git \
+            | awk '{ sub("refs/tags/", "", $2); peeled = sub(/\^\{\}$/, "", $2); if (peeled || !($2 in sha)) sha[$2] = $1 }
+                   END { for (t in sha) print t, sha[t] }' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+ ' | sort -V > upstream-releases.txt
+          base='' base_sha=''
+          while read -r tag sha; do
+            if git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then base="$tag" base_sha="$sha"; fi
+          done < upstream-releases.txt
+          if [ -z "$base" ]; then echo "::error::This commit contains no upstream release"; exit 1; fi
+          if [ "$base" != "$claimed" ]; then
+            echo "::error::$GITHUB_REF_NAME says it is based on $claimed, but the newest upstream release in its history is $base: name it $base-rt.<revision>"
+            exit 1
+          fi
+          echo "Based on upstream $base ($base_sha)"
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+
   linux:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +95,7 @@ jobs:
           if-no-files-found: error
 
   native:
+    needs: check
     strategy:
       fail-fast: false
       matrix:
@@ -91,12 +133,15 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [linux, native]
+    needs: [check, linux, native]
     name: Publish the GitHub release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
@@ -110,9 +155,16 @@ jobs:
       - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
+          BASE: ${{ needs.check.outputs.base }}
+          BASE_SHA: ${{ needs.check.outputs.base_sha }}
         run: |
           linux=$(grep -- '-linux-x64.node$' release/SHA256SUMS | cut -d' ' -f1)
+          changes=$(git log --no-merges --format='- %s (%h)' "$BASE_SHA..$GITHUB_SHA")
           cat > notes.md <<EOF
+          Based on upstream [$BASE](https://github.com/WiseLibs/better-sqlite3/releases/tag/$BASE), with these commits on top:
+
+          $changes
+
           Built from $GITHUB_SHA. Node-API, for Node 22 and later. Put a binary at
           \`node_modules/better-sqlite3/prebuilds/<platform>-<arch>.node\`, where lib/binding.js loads it first.
 
